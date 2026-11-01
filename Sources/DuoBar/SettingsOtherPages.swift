@@ -318,7 +318,7 @@ struct UpdatesSettingsPage: View {
 struct GeneralSettingsPage: View {
     @Bindable var model: AppModel
 
-    private static let author = URL(string: "https://github.com/Mujh05")!
+    private static let author = URL(string: "https://github.com/elovria")!
     private static let homepage = URL(string: "https://github.com/\(UpdateChecker.repository)")!
     private static let issues = URL(string: "https://github.com/\(UpdateChecker.repository)/issues")!
 
@@ -372,7 +372,7 @@ struct GeneralSettingsPage: View {
             }
             .padding(.vertical, 4)
             LabeledContent("作者") {
-                Link("Mujh05", destination: Self.author)
+                Link("elovria", destination: Self.author)
             }
             LabeledContent("项目主页") {
                 Link("在 GitHub 上查看", destination: Self.homepage)
