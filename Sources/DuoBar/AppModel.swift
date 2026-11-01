@@ -214,6 +214,7 @@ final class AppModel {
                 bluetoothAccess = BluetoothMonitor.access
                 refreshLoginItem()
             } else {
+                wifiScanGeneration += 1
                 wifiMessage = nil
                 chargeMessage = nil
                 // 面板收起时，没输完的密码当作取消。
@@ -291,13 +292,15 @@ final class AppModel {
     /// 打开其他 App 或系统设置后收起面板。
     @ObservationIgnored var onClosePanel: (() -> Void)?
     @ObservationIgnored private var wifiScanTask: Task<Void, Never>?
+    @ObservationIgnored private var wifiScanGeneration = 0
+    @ObservationIgnored private let wifiOperations: WiFiOperations
     @ObservationIgnored private var chargeLimitTask: Task<Void, Never>?
     @ObservationIgnored private var chargeStartTimeout: Task<Void, Never>?
     @ObservationIgnored private var energyTask: Task<Void, Never>?
     @ObservationIgnored private var updateTask: Task<Void, Never>?
 
     @ObservationIgnored private let batteryMonitor = BatteryMonitor()
-    @ObservationIgnored private let networkMonitor = NetworkMonitor()
+    @ObservationIgnored private let networkMonitor: NetworkMonitor
     @ObservationIgnored private let bluetoothMonitor = BluetoothMonitor()
     @ObservationIgnored private let location = LocationAccess()
     @ObservationIgnored private var cpuSampler = CPUSampler()
@@ -323,7 +326,10 @@ final class AppModel {
         static let skippedVersion = "skippedVersion"
     }
 
-    init() {
+    init(wifiOperations: WiFiOperations = .live, initialNetwork: NetworkInfo = .placeholder,
+         networkMonitor: NetworkMonitor = NetworkMonitor()) {
+        self.wifiOperations = wifiOperations
+        self.networkMonitor = networkMonitor
         let defaults = Self.defaults
         percentMode = PercentMode(rawValue: defaults.string(forKey: Keys.percentMode) ?? "") ?? .whenLow
         layout = defaults.string(forKey: Keys.layout).flatMap(IconLayout.init(storageValue:)) ?? .standard
@@ -336,6 +342,7 @@ final class AppModel {
         autoCheckUpdates = defaults.object(forKey: Keys.autoCheckUpdates) as? Bool ?? true
         lastUpdateCheck = defaults.object(forKey: Keys.lastUpdateCheck) as? Date
         skippedVersion = defaults.string(forKey: Keys.skippedVersion)
+        apply(initialNetwork)
     }
 
     private func save(_ value: Any, _ key: String) {
@@ -353,7 +360,14 @@ final class AppModel {
         location.onChange = { [weak self] state in
             guard let self else { return }
             ssidAccess = state
+            wifiScanGeneration += 1
+            networkMonitor.clearSSIDCache()
             networkMonitor.refresh()
+            if state != .granted {
+                wifiNetworks = []
+                wifiUnnamedCount = 0
+                cancelPassword()
+            }
             // 刚授权时立刻重新扫描，把网络名称显示出来。
             if panelVisible, showWiFiControls, network.wifiPowered {
                 Task { await self.scanWiFi() }
@@ -656,9 +670,11 @@ final class AppModel {
         let powerChanged = info.wifiPowered != network.wifiPowered
         network = info
         if powerChanged {
+            wifiScanGeneration += 1
             if !info.wifiPowered {
                 wifiNetworks = []
                 wifiUnnamedCount = 0
+                cancelPassword()
             }
             updateWiFiScanning()
         }
@@ -798,25 +814,39 @@ final class AppModel {
     }
 
     func scanWiFi() async {
-        guard !wifiScanning else { return }
+        guard canScanWiFi, !wifiScanning, !Task.isCancelled else { return }
+        let generation = wifiScanGeneration
         wifiScanning = true
-        defer { wifiScanning = false }
+        defer {
+            wifiScanning = false
+            // 授权或面板状态变了，旧结果作废后用新状态重扫。
+            if generation != wifiScanGeneration, canScanWiFi {
+                Task { await self.scanWiFi() }
+            }
+        }
         do {
-            let scan = try await WiFiControl.scan()
+            let scan = try await wifiOperations.scan()
+            guard generation == wifiScanGeneration, canScanWiFi, !Task.isCancelled else { return }
             wifiNetworks = scan.networks
             wifiUnnamedCount = scan.unnamed
         } catch {
+            guard generation == wifiScanGeneration, canScanWiFi, !Task.isCancelled else { return }
             wifiMessage = "搜索网络失败：\(error.localizedDescription)"
         }
     }
 
+    private var canScanWiFi: Bool {
+        panelVisible && showWiFiControls && network.wifiPowered && !wifiSwitching && joiningSSID == nil
+    }
+
     func setWiFiPower(_ on: Bool) {
-        guard !wifiSwitching else { return }
+        guard !wifiSwitching, joiningSSID == nil else { return }
+        wifiScanGeneration += 1
         wifiSwitching = true
         wifiMessage = nil
         Task {
             do {
-                try await WiFiControl.setPower(on)
+                try await wifiOperations.setPower(on)
             } catch {
                 wifiMessage = "无法\(on ? "打开" : "关闭") Wi-Fi：\(error.localizedDescription)"
             }
@@ -827,11 +857,15 @@ final class AppModel {
 
     /// 加入网络：已保存的网络直接加入，需要密码的新网络先问密码，企业网络交给系统设置。
     func join(_ target: WiFiNetwork) {
-        guard joiningSSID == nil, target.ssid != network.ssid else { return }
+        guard panelVisible, network.wifiPowered, !wifiSwitching,
+              joiningSSID == nil, target.ssid != network.ssid else { return }
         if target.enterprise {
             openWiFiSettings()
             return
         }
+        wifiScanGeneration += 1
+        // 正在输入密码的行必须一直存在，直到完成或取消加入。
+        if !wifiNetworks.contains(where: { $0.ssid == target.ssid }) { wifiNetworks.append(target) }
         joiningSSID = target.ssid
         wifiMessage = nil
         Task {
@@ -850,23 +884,24 @@ final class AppModel {
             await attemptJoin(target, password: nil, step: "开放网络")
             return
         }
-        if let saved = WiFiPasswords.password(for: target.ssid) {
+        if let saved = wifiOperations.password(target.ssid) {
             if await attemptJoin(target, password: saved, step: "记住的密码") { return }
         }
         // 输错了就再问一次，直到加入成功或者用户取消。
-        var hint: String?
+        var hint = wifiMessage
         while let entered = await requestPassword(for: target.ssid, hint: hint) {
             if await attemptJoin(target, password: entered.password, step: "手动输入的密码") {
                 if entered.remember { WiFiPasswords.save(entered.password, for: target.ssid) }
                 return
             }
-            hint = "没能加入，请检查密码后再试一次"
+            hint = wifiMessage ?? "没能加入，请检查密码后再试一次"
         }
     }
 
     /// 在面板里这个网络下面展开密码框，等用户输入或取消。hint 显示在密码框上面，比如上次没加入成功。
     private func requestPassword(for ssid: String, hint: String? = nil) async -> (password: String, remember: Bool)? {
         cancelPassword()
+        guard panelVisible, network.wifiPowered else { return nil }
         wifiMessage = nil
         passwordPromptHint = hint
         passwordPromptSSID = ssid
@@ -899,7 +934,7 @@ final class AppModel {
     @discardableResult
     private func attemptJoin(_ target: WiFiNetwork, password: String?, step: String) async -> Bool {
         do {
-            try await WiFiControl.join(ssid: target.ssid, password: password)
+            try await wifiOperations.join(target.ssid, password)
             Self.wifiLog.notice("加入成功：\(step, privacy: .public)")
             wifiMessage = nil
             return true
@@ -1079,7 +1114,10 @@ final class AppModel {
         case .denied:
             openPrivacySettings("Privacy_LocationServices")
         case .granted:
+            wifiScanGeneration += 1
+            networkMonitor.clearSSIDCache()
             networkMonitor.refresh()
+            Task { await self.scanWiFi() }
         }
     }
 

@@ -20,11 +20,13 @@ struct WiFiNetwork: Identifiable, Sendable, Equatable {
 
 enum WiFiControlError: LocalizedError {
     case noInterface
+    case poweredOff
     case notFound
 
     var errorDescription: String? {
         switch self {
         case .noInterface: "这台 Mac 没有 Wi-Fi"
+        case .poweredOff: "Wi-Fi 已关闭，请先打开 Wi-Fi"
         case .notFound: "附近找不到这个网络"
         }
     }
@@ -36,11 +38,62 @@ struct WiFiScan: Sendable {
     var unnamed: Int
 }
 
-/// Wi-Fi 开关、扫描和加入网络。CoreWLAN 的这些调用会阻塞几秒，全部放到后台线程。
+struct WiFiSnapshot: Sendable {
+    var info: NetworkInfo
+    var bssid: String?
+}
+
+/// CoreWLAN 会阻塞；串行执行，避免扫描、切网和开关同时操作无线网卡。
 enum WiFiControl {
+    private static let queue = DispatchQueue(label: "com.mujh.DuoBar.wifi", qos: .userInitiated)
+
+    private static func perform<T: Sendable>(_ operation: @escaping @Sendable () throws -> T) async throws -> T {
+        try Task.checkCancellation()
+        return try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                do { continuation.resume(returning: try operation()) }
+                catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
+
+    static func snapshot() async -> WiFiSnapshot {
+        // 读取不会抛错；没有网卡时返回占位状态。
+        (try? await perform {
+            var info = NetworkInfo.placeholder
+            guard let iface = CWWiFiClient.shared().interface() else {
+                return WiFiSnapshot(info: info, bssid: nil)
+            }
+            info.hasWiFiHardware = true
+            info.wifiPowered = iface.powerOn()
+            guard info.wifiPowered else { return WiFiSnapshot(info: info, bssid: nil) }
+            let ssid = iface.ssid().flatMap { $0.isEmpty ? nil : $0 }
+            let bssid = iface.bssid().flatMap { $0.isEmpty ? nil : $0 }
+            let rssi = iface.rssiValue()
+            info.wifiAssociated = ssid != nil || bssid != nil || rssi != 0
+            if info.wifiAssociated {
+                info.ssid = ssid
+                info.rssi = rssi == 0 ? nil : rssi
+                info.noise = iface.noiseMeasurement()
+                info.txRate = iface.transmitRate()
+                if let channel = iface.wlanChannel() {
+                    info.channel = channel.channelNumber
+                    info.band = switch channel.channelBand {
+                    case .band2GHz: "2.4 GHz"
+                    case .band5GHz: "5 GHz"
+                    case .band6GHz: "6 GHz"
+                    default: nil
+                    }
+                }
+            }
+            return WiFiSnapshot(info: info, bssid: bssid)
+        }) ?? WiFiSnapshot(info: .placeholder, bssid: nil)
+    }
+
     static func scan() async throws -> WiFiScan {
-        try await Task.detached(priority: .userInitiated) {
+        try await perform {
             guard let iface = CWWiFiClient.shared().interface() else { throw WiFiControlError.noInterface }
+            guard iface.powerOn() else { throw WiFiControlError.poweredOff }
             let profiles = iface.configuration()?.networkProfiles.array as? [CWNetworkProfile] ?? []
             let known = Set(profiles.compactMap(\.ssid))
 
@@ -55,31 +108,34 @@ enum WiFiControl {
                 strongest[ssid] = describe(network, ssid: ssid, known: known.contains(ssid))
             }
             return WiFiScan(networks: strongest.values.sorted { $0.rssi > $1.rssi }, unnamed: unnamed)
-        }.value
+        }
     }
 
     static func setPower(_ on: Bool) async throws {
-        try await Task.detached(priority: .userInitiated) {
+        try await perform {
             guard let iface = CWWiFiClient.shared().interface() else { throw WiFiControlError.noInterface }
             try iface.setPower(on)
-        }.value
+        }
     }
 
-    /// 加入网络。password 为 nil 时用于开放网络，或让系统使用已保存的密码。
+    /// 加入网络。加密网络的 password 由 DuoBar 钥匙串或用户输入提供。
     static func join(ssid: String, password: String?) async throws {
-        try await Task.detached(priority: .userInitiated) {
+        try await perform {
             guard let iface = CWWiFiClient.shared().interface() else { throw WiFiControlError.noInterface }
-            let matches = try iface.scanForNetworks(withName: ssid, includeHidden: false)
-            guard let network = matches.max(by: { $0.rssiValue < $1.rssiValue }) else {
+            guard iface.powerOn() else { throw WiFiControlError.poweredOff }
+            // 重新查找仍在附近的接入点，避免反复连接已离开的旧接入点。
+            let candidates = try iface.scanForNetworks(withName: ssid, includeHidden: true)
+                .filter { $0.ssid == ssid }
+            guard let network = candidates.max(by: { $0.rssiValue < $1.rssiValue }) else {
                 throw WiFiControlError.notFound
             }
             try iface.associate(to: network, password: password)
-        }.value
+        }
     }
 
     /// 开发用：只读地检查扫描是否可用、能不能看到网络名称，不改变任何 Wi-Fi 状态。
     static func debugSummary() async -> String {
-        await Task.detached {
+        (try? await perform {
             guard let iface = CWWiFiClient.shared().interface() else { return "no interface" }
             let profiles = iface.configuration()?.networkProfiles.array as? [CWNetworkProfile] ?? []
             var lines = [
@@ -96,7 +152,7 @@ enum WiFiControl {
                 lines.append("scan failed: \(error.localizedDescription)")
             }
             return lines.joined(separator: "\n")
-        }.value
+        }) ?? "Wi-Fi diagnostics unavailable"
     }
 
     private static func describe(_ network: CWNetwork, ssid: String, known: Bool) -> WiFiNetwork {

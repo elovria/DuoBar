@@ -1,3 +1,4 @@
+import AppKit
 import CoreLocation
 
 /// macOS 只把 Wi-Fi 名称给有定位权限的 App。DuoBar 只用它来显示网络名称，不读取位置。
@@ -18,6 +19,8 @@ final class LocationAccess: NSObject {
     var state: State { Self.state(for: manager.authorizationStatus) }
 
     func request() {
+        // 菜单面板默认不激活 App，系统授权框需要由前台 App 发起。
+        NSApp.activate(ignoringOtherApps: true)
         manager.requestWhenInUseAuthorization()
     }
 

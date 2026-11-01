@@ -22,7 +22,7 @@ struct WiFiSection: View {
                 ))
                 .toggleStyle(.switch)
                 .labelsHidden()
-                .disabled(model.wifiSwitching)
+                .disabled(model.wifiSwitching || model.joiningSSID != nil)
             }
 
             if model.network.wifiPowered {
@@ -45,19 +45,22 @@ struct WiFiSection: View {
         let others = model.wifiNetworks.filter { !$0.known && $0.ssid != current }
 
         if needsLocationAccess {
-            MenuRow(title: model.ssidAccess == .denied ? "去开启定位权限…" : "显示网络名称…",
-                    subtitle: "macOS 只把网络名称提供给有定位权限的 App",
+            MenuRow(title: model.ssidAccess == .granted ? "重新读取网络名称…" :
+                        (model.ssidAccess == .denied ? "去开启定位权限…" : "显示网络名称…"),
+                    subtitle: model.ssidAccess == .granted ? "系统暂未返回名称，点此重试" :
+                        "macOS 只把网络名称提供给有定位权限的 App",
                     help: "DuoBar 只用它显示网络名称，不会读取你的位置。",
                     action: { model.requestSSIDAccess() }) {
                 IconCircle(symbol: "location.fill", active: false)
             }
-        } else if current != nil || !known.isEmpty {
+        }
+        if current != nil || !known.isEmpty {
             MenuSectionHeader(title: "已知网络")
             if let current {
                 row(currentNetwork(current), connected: true)
             }
             ForEach(known) { row($0, connected: false) }
-        } else if model.wifiNetworks.isEmpty {
+        } else if model.wifiNetworks.isEmpty && !needsLocationAccess {
             MenuNote(text: model.wifiScanning ? "正在搜索网络…" : "附近没有找到网络")
         }
 
@@ -90,8 +93,8 @@ struct WiFiSection: View {
 
     /// 扫描到了网络却读不到名称：macOS 需要定位权限才给名称。
     private var needsLocationAccess: Bool {
-        model.wifiNetworks.isEmpty
-            && (model.wifiUnnamedCount > 0 || (model.network.wifiAssociated && currentSSID == nil))
+        model.ssidAccess != .granted
+            || (model.network.wifiAssociated && currentSSID == nil)
     }
 
     /// 当前网络：优先用扫描结果（知道是否加密），信号强度用实时读数。
@@ -105,7 +108,7 @@ struct WiFiSection: View {
     private func row(_ network: WiFiNetwork, connected: Bool) -> some View {
         let asking = model.passwordPromptSSID == network.ssid
         let joining = model.joiningSSID == network.ssid && !asking
-        let busy = model.joiningSSID != nil
+        let busy = model.joiningSSID != nil || model.wifiSwitching
         return VStack(spacing: 0) {
             MenuRow(
                 title: network.ssid,

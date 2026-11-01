@@ -8,6 +8,10 @@ let package = Package(
         .executableTarget(
             name: "DuoBar",
             path: "Sources/DuoBar"
+        ),
+        .testTarget(
+            name: "DuoBarTests",
+            dependencies: ["DuoBar"]
         )
     ]
 )
